@@ -57,4 +57,12 @@ final class ModelPath implements \Stringable
 
         return $clone;
     }
+
+    public function withArrayLiteral(string $component): self
+    {
+        $clone = clone $this;
+        $clone->path[] = new ArrayEntry((string)new LiteralValue($component));
+
+        return $clone;
+    }
 }
