@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Liip\Serializer;
 
 use Liip\MetadataParser\Builder;
+use Liip\MetadataParser\Metadata\AbstractPropertyType;
 use Liip\MetadataParser\Metadata\ClassMetadata;
 use Liip\MetadataParser\Metadata\PropertyMetadata;
 use Liip\MetadataParser\Metadata\PropertyType;
@@ -191,23 +192,69 @@ final class SerializerGenerator
 
         $modelPropertyPath = $modelPath.'->'.$propertyMetadata->getName();
         $fieldPath = $arrayPath.'["'.$propertyMetadata->getSerializedName().'"]';
+        $type = $propertyMetadata->getType();
+        $requiresExplicitNullSet = $this->fieldTypeRequiresExplicitNullSet($type);
+        $shouldSerializeNull = $this->configuration->shouldSerializeNull();
+        $setNull = $shouldSerializeNull ? $this->templating->renderAssign($fieldPath, 'null') : null;
 
         if ($propertyMetadata->getAccessor()->hasGetterMethod()) {
             $tempVariable = str_replace(['->', '[', ']', '$'], '', $modelPath).ucfirst($propertyMetadata->getName());
+            $value = $this->templating->renderGetter($modelPath, $propertyMetadata->getAccessor()->getGetterMethod());
+
+            if ($shouldSerializeNull && !$requiresExplicitNullSet) {
+                return $this->generateCodeForFieldType($type, $apiVersion, $serializerGroups, $fieldPath, $value, $stack)."\n";
+            }
+
+            // the conditional is a null check, so the remaining expressions can assume non-null types
+            $nonNullType = ($type instanceof AbstractPropertyType) ? $type->asNullable(false) : $type;
 
             return $this->templating->renderConditional(
-                $this->templating->renderTempVariable($tempVariable, $this->templating->renderGetter($modelPath, $propertyMetadata->getAccessor()->getGetterMethod())),
-                $this->generateCodeForFieldType($propertyMetadata->getType(), $apiVersion, $serializerGroups, $fieldPath, '$'.$tempVariable, $stack)
+                $this->templating->renderTempVariable($tempVariable, $value),
+                $this->generateCodeForFieldType($nonNullType, $apiVersion, $serializerGroups, $fieldPath, '$'.$tempVariable, $stack),
+                $setNull
             );
         }
         if (!$propertyMetadata->isPublic()) {
             throw new \Exception(\sprintf('Property %s is not public and no getter has been defined. Stack %s', $modelPropertyPath, var_export($stack, true)));
         }
 
-        return $this->templating->renderConditional(
-            $modelPropertyPath,
-            $this->generateCodeForFieldType($propertyMetadata->getType(), $apiVersion, $serializerGroups, $fieldPath, $modelPropertyPath, $stack)
-        );
+        $serializeField = $this->generateCodeForFieldType($type, $apiVersion, $serializerGroups, $fieldPath, $modelPropertyPath, $stack);
+
+        if (!$shouldSerializeNull) {
+            return $this->templating->renderConditional($modelPropertyPath, $serializeField);
+        }
+
+        return $requiresExplicitNullSet
+            ? $this->templating->renderConditional($modelPropertyPath, $serializeField, $setNull)
+            : "{$serializeField}\n";
+    }
+
+    /**
+     * Whether a PropertyType requires the target to be set to null in a separate statement (returns true), or its expression already allows the null case (returns false)
+     *
+     * @return bool True if the type needs a separate statement for the null case
+     */
+    private function fieldTypeRequiresExplicitNullSet(PropertyType $type): bool
+    {
+        if (!$type->isNullable()) {
+            return false;
+        }
+
+        switch ($type) {
+            case $type instanceof PropertyTypePrimitive:
+            case $type instanceof PropertyTypeUnknown:
+            case $type instanceof PropertyTypeDateTime: // can use the null-check operator
+            case $type instanceof PropertyTypeEnum: // can use the null-check operator
+                return false;
+
+            case $type instanceof PropertyTypeClass:
+            case $type instanceof PropertyTypeIterable:
+                return true;
+
+            case $type instanceof PropertyTypeUnion:
+        }
+
+        return false;
     }
 
     /**
@@ -225,11 +272,9 @@ final class SerializerGenerator
         switch ($type) {
             case $type instanceof PropertyTypeDateTime:
                 $dateFormat = $type->getFormat() ?: \DateTimeInterface::ISO8601;
+                $dateToString = $this->templating->renderDateTime($modelPropertyPath, $dateFormat, $type->isNullable());
 
-                return $this->templating->renderAssign(
-                    $fieldPath,
-                    $this->templating->renderDateTime($modelPropertyPath, $dateFormat)
-                );
+                return $this->templating->renderAssign($fieldPath, $dateToString);
 
             case $type instanceof PropertyTypePrimitive:
             case $type instanceof PropertyTypeUnknown:
@@ -238,6 +283,7 @@ final class SerializerGenerator
 
             case $type instanceof PropertyTypeEnum:
                 $valueAccess = $type->shouldSerializeAsValue() ? '->value' : '->name';
+                $valueAccess = ($type->isNullable() ? '?' : '').$valueAccess;
 
                 return $this->templating->renderAssign($fieldPath, $modelPropertyPath.$valueAccess);
 
@@ -268,6 +314,7 @@ final class SerializerGenerator
         array $stack,
     ): string {
         $index = '$index'.mb_strlen($arrayPath);
+        $resolvedModelPath = "{$index}Array";
         $subType = $type->getSubType();
 
         switch ($subType) {
@@ -277,15 +324,15 @@ final class SerializerGenerator
                 return $this->templating->renderArrayAssign($arrayPath, $modelPath);
 
             case $subType instanceof PropertyTypeIterable:
-                $innerCode = $this->generateCodeForArray($subType, $apiVersion, $serializerGroups, $arrayPath.'['.$index.']', $modelPath.'['.$index.']', $stack);
+                $innerCode = $this->generateCodeForArray($subType, $apiVersion, $serializerGroups, $arrayPath.'['.$index.']', $resolvedModelPath.'['.$index.']', $stack);
                 break;
 
             case $subType instanceof PropertyTypeEnum:
-                $innerCode = $this->generateCodeForFieldType($subType, $apiVersion, $serializerGroups, $arrayPath.'['.$index.']', $modelPath.'['.$index.']', $stack);
+                $innerCode = $this->generateCodeForFieldType($subType, $apiVersion, $serializerGroups, $arrayPath.'['.$index.']', $resolvedModelPath.'['.$index.']', $stack);
                 break;
 
             case $subType instanceof PropertyTypeClass:
-                $innerCode = $this->generateCodeForClass($subType->getClassMetadata(), $apiVersion, $serializerGroups, $arrayPath.'['.$index.']', $modelPath.'['.$index.']', $stack);
+                $innerCode = $this->generateCodeForClass($subType->getClassMetadata(), $apiVersion, $serializerGroups, $arrayPath.'['.$index.']', $resolvedModelPath.'['.$index.']', $stack);
                 break;
 
             default:
