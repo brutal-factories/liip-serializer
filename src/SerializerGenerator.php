@@ -196,6 +196,8 @@ final class SerializerGenerator
         $requiresExplicitNullSet = $this->fieldTypeRequiresExplicitNullSet($type);
         $shouldSerializeNull = $this->configuration->shouldSerializeNull();
         $setNull = $shouldSerializeNull ? $this->templating->renderAssign($fieldTarget, 'null') : null;
+        // The conditionals are null checks, so expressions under one can assume non-null types
+        $nonNullType = ($type instanceof AbstractPropertyType) ? $type->asNullable(false) : $type;
 
         if ($propertyMetadata->getAccessor()->hasGetterMethod()) {
             $tempVariable = ModelPath::tempVariable(["{$modelPath}", ucfirst($propertyMetadata->getName())]);
@@ -205,9 +207,6 @@ final class SerializerGenerator
             if ($shouldSerializeNull && !$requiresExplicitNullSet) {
                 return $this->generateCodeForFieldType($type, $fieldTarget, $value, $stack)."\n";
             }
-
-            // the conditional is a null check, so the remaining expressions can assume non-null types
-            $nonNullType = ($type instanceof AbstractPropertyType) ? $type->asNullable(false) : $type;
 
             return $this->templating->renderConditional(
                 $this->templating->renderTempVariable($tempVariable, "{$value}"),
@@ -219,15 +218,14 @@ final class SerializerGenerator
             throw new \Exception(\sprintf('Property %s is not public and no getter has been defined. Stack %s', $modelProperty, var_export($stack, true)));
         }
 
-        $serializeField = $this->generateCodeForFieldType($type, $fieldTarget, $modelProperty, $stack);
-
-        if (!$shouldSerializeNull) {
-            return $this->templating->renderConditional("{$modelProperty}", $serializeField);
+        if ($shouldSerializeNull && !$requiresExplicitNullSet) {
+            return $this->generateCodeForFieldType($type, $fieldTarget, $modelProperty, $stack)."\n";
         }
 
-        return $requiresExplicitNullSet
-            ? $this->templating->renderConditional("{$modelProperty}", $serializeField, $setNull)
-            : "{$serializeField}\n";
+        // thanks to the `if ($shouldSerializeNull && !$requiresExplicitNullSet)`, we know we need an if-else to contain the 2 cases (null and non-null).
+        $serializeField = $this->generateCodeForFieldType($nonNullType, $fieldTarget, $modelProperty, $stack);
+
+        return $this->templating->renderConditional("$modelProperty", $serializeField, $shouldSerializeNull ? $setNull : null);
     }
 
     /**
